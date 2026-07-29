@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-KK_szlife 微博监控脚本（增强版 v4）
+KK_szlife 微博监控脚本（增强版 v4.4）
 - RSS 获取微博列表
 - Playwright 访问每条微博详情页，提取时间戳、图片URL、截图
 - 下载微博图片
-- 生成 PDF 分析报告 + PDF 微博记录汇总（含真实图片和截图）
-- 通过邮件发送两份 PDF 附件
+- 生成 PDF 分析报告（不含截图，体积更小）+ PDF 微博记录汇总（含图片和截图）
+- 通过邮件发送两份 PDF 附件（大文件自动回退为 GitHub 下载链接）
 """
 
 import os
@@ -42,6 +42,11 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", "")
+
+# GitHub repo for large file fallback links
+GITHUB_REPO = "szqiangge/weibo-monitor"
+GITHUB_BRANCH = "main"
+MAX_EMAIL_PDF_KB = 1200  # PDFs larger than this will use GitHub link instead
 
 MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
@@ -417,7 +422,7 @@ strong {{ color: #1a1a1a; }}
 .weibo-card {{ border: 1px solid #e1e4e8; border-radius: 8px; padding: 15px 20px; margin: 15px 0; background: #fff; page-break-inside: avoid; }}
 .weibo-time {{ color: #999; font-size: 0.9em; margin-bottom: 8px; font-weight: bold; }}
 .weibo-images {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }}
-.weibo-images img {{ width: 200px; height: auto; border-radius: 4px; border: 1px solid #eee; }}
+.weibo-images img {{ width: 150px; height: auto; border-radius: 4px; border: 1px solid #eee; }}
 .weibo-screenshot img {{ width: 100%; max-width: 420px; border-radius: 8px; border: 1px solid #ddd; }}
 table {{ border-collapse: collapse; width: 100%; margin: 15px 0; }}
 th, td {{ border: 1px solid #ddd; padding: 8px 12px; text-align: left; }}
@@ -479,11 +484,8 @@ th {{ background: #f0f0f0; font-weight: bold; }}
                     html += f'<img src="file://{os.path.abspath(img_path)}" alt="微博图片">\n'
                 html += '</div>\n'
 
-            # Screenshot
-            if bid and bid in enhanced_data:
-                screenshot = enhanced_data[bid].get("screenshot")
-                if screenshot and os.path.exists(screenshot):
-                    html += f'<div class="weibo-screenshot"><h4>微博页面截图</h4><img src="file://{os.path.abspath(screenshot)}" alt="截图"></div>\n'
+            # Note: screenshots are omitted from analysis to keep PDF size small;
+            # they are included in the records PDF instead.
 
             html += f'<div><a href="{link}">查看原文</a></div>\n</div>\n<hr>\n'
     else:
@@ -510,9 +512,9 @@ th {{ background: #f0f0f0; font-weight: bold; }}
     if full_analysis:
         try:
             import markdown2
-            # Truncate to first ~3000 chars to keep PDF size manageable
-            truncated = full_analysis[:3000]
-            if len(full_analysis) > 3000:
+            # Truncate to first ~1500 chars to keep PDF size manageable for email
+            truncated = full_analysis[:1500]
+            if len(full_analysis) > 1500:
                 truncated += "\n\n[... 完整报告请见 GitHub 仓库: reports/KK_szlife_full_analysis.md ...]\n"
             html_body = markdown2.markdown(truncated, extras=["tables", "fenced-code-blocks"])
         except ImportError:
@@ -601,8 +603,8 @@ hr {{ border: none; border-top: 1px solid #ccc; margin: 30px 0; }}
 
 
 # ==================== PDF 生成 ====================
-def compress_images(image_paths, max_width=800, quality=75):
-    """Compress images to reduce PDF size"""
+def compress_images(image_paths, max_width=600, quality=50):
+    """Compress images to reduce PDF size (aggressive settings for email compatibility)"""
     try:
         from PIL import Image
     except ImportError:
@@ -706,8 +708,29 @@ def send_single_email(filepath, subject, body):
     return True
 
 
+def send_text_email(subject, body):
+    """Send a plain text email without attachments (for GitHub download links)"""
+    if not SMTP_SERVER:
+        print("    SMTP not configured, skipping email")
+        return False
+
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_USER
+    msg["To"] = NOTIFY_EMAIL
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    print(f"  Sending text email: {subject}")
+    server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+    server.login(SMTP_USER, SMTP_PASS)
+    server.sendmail(SMTP_USER, NOTIFY_EMAIL, msg.as_string())
+    server.quit()
+    print(f"  Sent OK")
+    return True
+
+
 def send_email(attachments, new_count, total_count):
-    """Send emails with PDF attachments (one per email to avoid spam filters)"""
+    """Send emails with PDF attachments. Large PDFs use GitHub links instead."""
     if not SMTP_SERVER:
         print("    SMTP not configured, skipping email")
         return False
@@ -720,19 +743,41 @@ def send_email(attachments, new_count, total_count):
             continue
 
         filename = os.path.basename(filepath)
+        file_size_kb = os.path.getsize(filepath) // 1024
+
         if "analysis" in filename:
             subject = f"Weibo Monitor Report {now}"
             if new_count > 0:
-                body = f"Report: {new_count} new posts, {total_count} total.\nTime: {timestamp}\nAttachment: Analysis report with images and screenshots."
+                body = f"Report: {new_count} new posts, {total_count} total.\nTime: {timestamp}\nAttachment: Analysis report with images."
             else:
-                body = f"Report: {total_count} posts monitored.\nTime: {timestamp}\nAttachment: Analysis report with images and screenshots."
+                body = f"Report: {total_count} posts monitored.\nTime: {timestamp}\nAttachment: Analysis report with images."
         else:
             subject = f"Weibo Records {now}"
             body = f"Records: {total_count} posts.\nTime: {timestamp}\nAttachment: Weibo records with images and screenshots."
 
+        # Check if PDF is too large for email attachment
+        if file_size_kb > MAX_EMAIL_PDF_KB:
+            print(f"  PDF too large ({file_size_kb}KB > {MAX_EMAIL_PDF_KB}KB limit), using GitHub link instead")
+            # Build GitHub raw download URL
+            github_path = filepath.replace("\\", "/")
+            github_url = f"https://github.com/{GITHUB_REPO}/raw/{GITHUB_BRANCH}/{github_path}"
+            link_body = (
+                f"Report: {new_count} new posts, {total_count} total.\n"
+                f"Time: {timestamp}\n\n"
+                f"The analysis report PDF ({file_size_kb}KB) exceeds the email attachment size limit.\n"
+                f"Download it from GitHub:\n{github_url}\n\n"
+                f"The weibo records PDF is sent in a separate email."
+            )
+            try:
+                send_text_email(subject, link_body)
+                time.sleep(3)
+            except Exception as e:
+                print(f"  Link email error: {e}")
+            continue
+
         try:
             send_single_email(filepath, subject, body)
-            time.sleep(3)  # Delay between emails
+            time.sleep(3)
         except Exception as e:
             print(f"  Email error: {e}")
             # Retry with simpler content
