@@ -730,7 +730,8 @@ def send_text_email(subject, body):
 
 
 def send_email(attachments, new_count, total_count):
-    """Send emails with PDF attachments. Large PDFs use GitHub links instead."""
+    """Send emails with PDF attachments. Large PDFs use GitHub links instead.
+    Uses multiple retries with increasing delays to handle 139 email spam score fluctuations."""
     if not SMTP_SERVER:
         print("    SMTP not configured, skipping email")
         return False
@@ -758,35 +759,58 @@ def send_email(attachments, new_count, total_count):
         # Check if PDF is too large for email attachment
         if file_size_kb > MAX_EMAIL_PDF_KB:
             print(f"  PDF too large ({file_size_kb}KB > {MAX_EMAIL_PDF_KB}KB limit), using GitHub link instead")
-            # Build GitHub raw download URL
             github_path = filepath.replace("\\", "/")
             github_url = f"https://github.com/{GITHUB_REPO}/raw/{GITHUB_BRANCH}/{github_path}"
             link_body = (
                 f"Report: {new_count} new posts, {total_count} total.\n"
                 f"Time: {timestamp}\n\n"
-                f"The analysis report PDF ({file_size_kb}KB) exceeds the email attachment size limit.\n"
+                f"The report PDF ({file_size_kb}KB) exceeds the email attachment size limit.\n"
                 f"Download it from GitHub:\n{github_url}\n\n"
-                f"The weibo records PDF is sent in a separate email."
+                f"The other PDF is sent in a separate email."
             )
             try:
                 send_text_email(subject, link_body)
-                time.sleep(3)
+                time.sleep(15)
             except Exception as e:
                 print(f"  Link email error: {e}")
             continue
 
-        try:
-            send_single_email(filepath, subject, body)
-            time.sleep(3)
-        except Exception as e:
-            print(f"  Email error: {e}")
-            # Retry with simpler content
+        # Try sending with up to 3 retries, increasing delays
+        sent = False
+        retry_delays = [0, 15, 30]  # first try, then wait 15s, then 30s
+        for attempt, delay in enumerate(retry_delays):
+            if delay > 0:
+                print(f"  Waiting {delay}s before retry {attempt+1}...")
+                time.sleep(delay)
             try:
-                print(f"  Retrying with simplified content...")
-                send_single_email(filepath, f"Report {now}", f"See attachment.\n{timestamp}")
-                time.sleep(3)
-            except Exception as e2:
-                print(f"  Retry also failed: {e2}")
+                if attempt == 0:
+                    send_single_email(filepath, subject, body)
+                else:
+                    # Simplified content on retry
+                    send_single_email(filepath, f"Report {now}", f"See attachment.\n{timestamp}")
+                sent = True
+                break
+            except Exception as e:
+                print(f"  Attempt {attempt+1} failed: {e}")
+                if attempt < len(retry_delays) - 1:
+                    print(f"  Will retry...")
+
+        # If all retries failed, send GitHub link as fallback
+        if not sent:
+            print(f"  All email attempts failed, sending GitHub link fallback...")
+            github_path = filepath.replace("\\", "/")
+            github_url = f"https://github.com/{GITHUB_REPO}/raw/{GITHUB_BRANCH}/{github_path}"
+            link_body = (
+                f"Report: {new_count} new posts, {total_count} total.\n"
+                f"Time: {timestamp}\n\n"
+                f"Email delivery failed (spam score). Download from GitHub:\n{github_url}"
+            )
+            try:
+                send_text_email(subject, link_body)
+            except Exception as e:
+                print(f"  Fallback link email also failed: {e}")
+
+        time.sleep(15)  # Long delay between different attachments
 
     return True
 
