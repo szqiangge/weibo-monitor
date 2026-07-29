@@ -23,7 +23,7 @@ jobs:
 
       - name: 安装依赖
         run: |
-          pip install markdown2 playwright
+          pip install markdown2 playwright Pillow
           playwright install chromium --with-deps
 
       - name: 运行监控脚本
