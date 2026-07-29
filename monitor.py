@@ -730,8 +730,9 @@ def send_text_email(subject, body):
 
 
 def send_email(attachments, new_count, total_count):
-    """Send emails with PDF attachments. Large PDFs use GitHub links instead.
-    Uses multiple retries with increasing delays to handle 139 email spam score fluctuations."""
+    """Send ONE email with the smaller PDF as attachment + GitHub link for the larger PDF.
+    Minimizes SMTP connections to reduce 139 email spam score.
+    Fallback: text-only email with both GitHub links."""
     if not SMTP_SERVER:
         print("    SMTP not configured, skipping email")
         return False
@@ -739,80 +740,84 @@ def send_email(attachments, new_count, total_count):
     now = datetime.datetime.now().strftime("%Y-%m-%d")
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    for i, filepath in enumerate(attachments):
-        if not (os.path.exists(filepath) and os.path.getsize(filepath) > 0):
+    # Separate analysis and records PDFs
+    analysis_pdf = None
+    records_pdf = None
+    for f in attachments:
+        if not (os.path.exists(f) and os.path.getsize(f) > 0):
             continue
-
-        filename = os.path.basename(filepath)
-        file_size_kb = os.path.getsize(filepath) // 1024
-
-        if "analysis" in filename:
-            subject = f"Weibo Monitor Report {now}"
-            if new_count > 0:
-                body = f"Report: {new_count} new posts, {total_count} total.\nTime: {timestamp}\nAttachment: Analysis report with images."
-            else:
-                body = f"Report: {total_count} posts monitored.\nTime: {timestamp}\nAttachment: Analysis report with images."
+        if "analysis" in os.path.basename(f):
+            analysis_pdf = f
         else:
-            subject = f"Weibo Records {now}"
-            body = f"Records: {total_count} posts.\nTime: {timestamp}\nAttachment: Weibo records with images and screenshots."
+            records_pdf = f
 
-        # Check if PDF is too large for email attachment
-        if file_size_kb > MAX_EMAIL_PDF_KB:
-            print(f"  PDF too large ({file_size_kb}KB > {MAX_EMAIL_PDF_KB}KB limit), using GitHub link instead")
-            github_path = filepath.replace("\\", "/")
-            github_url = f"https://github.com/{GITHUB_REPO}/raw/{GITHUB_BRANCH}/{github_path}"
-            link_body = (
-                f"Report: {new_count} new posts, {total_count} total.\n"
-                f"Time: {timestamp}\n\n"
-                f"The report PDF ({file_size_kb}KB) exceeds the email attachment size limit.\n"
-                f"Download it from GitHub:\n{github_url}\n\n"
-                f"The other PDF is sent in a separate email."
-            )
-            try:
-                send_text_email(subject, link_body)
-                time.sleep(15)
-            except Exception as e:
-                print(f"  Link email error: {e}")
-            continue
+    # Build GitHub download URLs
+    def github_url(path):
+        clean_path = path.replace("\\", "/")
+        return f"https://github.com/{GITHUB_REPO}/raw/{GITHUB_BRANCH}/{clean_path}"
 
-        # Try sending with up to 3 retries, increasing delays
-        sent = False
-        retry_delays = [0, 15, 30]  # first try, then wait 15s, then 30s
-        for attempt, delay in enumerate(retry_delays):
-            if delay > 0:
-                print(f"  Waiting {delay}s before retry {attempt+1}...")
-                time.sleep(delay)
-            try:
-                if attempt == 0:
-                    send_single_email(filepath, subject, body)
-                else:
-                    # Simplified content on retry
-                    send_single_email(filepath, f"Report {now}", f"See attachment.\n{timestamp}")
-                sent = True
-                break
-            except Exception as e:
-                print(f"  Attempt {attempt+1} failed: {e}")
-                if attempt < len(retry_delays) - 1:
-                    print(f"  Will retry...")
+    # Strategy: send ONE email with records PDF attached + analysis GitHub link in body
+    attach_pdf = records_pdf or analysis_pdf  # prefer records (smaller)
+    link_pdf = analysis_pdf if records_pdf else None  # link the analysis PDF
 
-        # If all retries failed, send GitHub link as fallback
-        if not sent:
-            print(f"  All email attempts failed, sending GitHub link fallback...")
-            github_path = filepath.replace("\\", "/")
-            github_url = f"https://github.com/{GITHUB_REPO}/raw/{GITHUB_BRANCH}/{github_path}"
-            link_body = (
-                f"Report: {new_count} new posts, {total_count} total.\n"
-                f"Time: {timestamp}\n\n"
-                f"Email delivery failed (spam score). Download from GitHub:\n{github_url}"
-            )
-            try:
-                send_text_email(subject, link_body)
-            except Exception as e:
-                print(f"  Fallback link email also failed: {e}")
+    if not attach_pdf and not link_pdf:
+        print("    No PDFs to send")
+        return False
 
-        time.sleep(15)  # Long delay between different attachments
+    subject = f"Weibo Monitor {now}"
+    attach_size = os.path.getsize(attach_pdf) // 1024 if attach_pdf else 0
+    body_lines = [
+        f"Report: {new_count} new posts, {total_count} total.",
+        f"Time: {timestamp}",
+        "",
+    ]
 
-    return True
+    if attach_pdf:
+        body_lines.append(f"Attached: {os.path.basename(attach_pdf)} ({attach_size}KB)")
+    if link_pdf:
+        link_size = os.path.getsize(link_pdf) // 1024
+        body_lines.append(f"Analysis report ({link_size}KB): {github_url(link_pdf)}")
+
+    body = "\n".join(body_lines)
+
+    # Attempt 1: send email with attachment + link
+    print(f"  Strategy: 1 email with attachment + GitHub link")
+    if attach_pdf:
+        try:
+            send_single_email(attach_pdf, subject, body)
+            print(f"  Email sent successfully!")
+            return True
+        except Exception as e:
+            print(f"  Attempt 1 failed: {e}")
+    else:
+        # No attachment to send, just send text with links
+        try:
+            send_text_email(subject, body)
+            print(f"  Text email sent successfully!")
+            return True
+        except Exception as e:
+            print(f"  Text email attempt failed: {e}")
+
+    # Attempt 2: wait 60s, then send text-only email with all GitHub links
+    print(f"  Waiting 60s before fallback...")
+    time.sleep(60)
+
+    fallback_lines = [f"Report: {new_count} new posts, {total_count} total.", f"Time: {timestamp}", ""]
+    for f in [analysis_pdf, records_pdf]:
+        if f:
+            size_kb = os.path.getsize(f) // 1024
+            name = os.path.basename(f)
+            fallback_lines.append(f"{name} ({size_kb}KB): {github_url(f)}")
+    fallback_body = "\n".join(fallback_lines)
+
+    try:
+        send_text_email(f"Weibo Monitor Links {now}", fallback_body)
+        print(f"  Fallback text email sent!")
+        return True
+    except Exception as e:
+        print(f"  Fallback also failed: {e}")
+        print(f"  PDFs are available in GitHub repo: https://github.com/{GITHUB_REPO}")
+        return False
 
 
 # ==================== 主程序 ====================
