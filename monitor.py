@@ -201,13 +201,39 @@ def enhance_posts_with_playwright(posts):
                     except:
                         page.screenshot(path=screenshot_path, full_page=False)
 
+                    # Download images using Playwright context (bypasses Referer issues)
+                    local_image_paths = []
+                    for img_idx, img_url in enumerate(data.get("images", [])):
+                        ext = ".jpg"
+                        if ".png" in img_url:
+                            ext = ".png"
+                        elif ".gif" in img_url:
+                            ext = ".gif"
+                        img_filename = f"{bid}_{img_idx}{ext}"
+                        img_filepath = os.path.join(IMAGES_DIR, img_filename)
+                        if not (os.path.exists(img_filepath) and os.path.getsize(img_filepath) > 0):
+                            try:
+                                img_response = context.request.get(img_url, timeout=10000)
+                                if img_response.ok:
+                                    with open(img_filepath, "wb") as f:
+                                        f.write(img_response.body())
+                                    local_image_paths.append(img_filepath)
+                                    print(f"      Downloaded image: {img_filename}")
+                                else:
+                                    print(f"      Image download failed: {img_response.status}")
+                            except Exception as ie:
+                                print(f"      Image error: {ie}")
+                        else:
+                            local_image_paths.append(img_filepath)
+
                     enhanced[bid] = {
                         "text": data.get("text", ""),
                         "time": data.get("time", ""),
                         "images": data.get("images", []),
+                        "local_images": local_image_paths,
                         "screenshot": screenshot_path if os.path.exists(screenshot_path) else None,
                     }
-                    print(f"      time={data.get('time','?')}, imgs={len(data.get('images',[]))}, screenshot={'Y' if os.path.exists(screenshot_path) else 'N'}")
+                    print(f"      time={data.get('time','?')}, imgs={len(local_image_paths)}/{len(data.get('images',[]))}, screenshot={'Y' if os.path.exists(screenshot_path) else 'N'}")
 
                 except Exception as e:
                     print(f"      Failed: {e}")
@@ -237,48 +263,23 @@ def download_image(url, save_path):
 
 
 def download_all_images(posts, enhanced_data):
-    """Download images from enhanced data"""
-    print("  Downloading images...")
+    """Use images already downloaded by Playwright"""
+    print("  Collecting downloaded images...")
     os.makedirs(IMAGES_DIR, exist_ok=True)
-    image_map = {}  # post_id -> [local_paths]
+    image_map = {}
 
     for post in posts:
         bid = post.get("bid", "")
-        post_id = post.get("id") or post.get("link", "unknown")
-        local_images = []
+        post_id = post.get("id") or post.get("link", "")
 
-        # Get image URLs from enhanced data
-        pic_urls = []
+        # Use images downloaded by Playwright
         if bid and bid in enhanced_data:
-            pic_urls = enhanced_data[bid].get("images", [])
-
-        for i, pic_url in enumerate(pic_urls):
-            # Clean URL - convert thumbnail to large if needed
-            if "orj960" in pic_url or "mw2000" in pic_url:
-                pic_url = pic_url
-            elif "thumbnail" in pic_url:
-                pic_url = pic_url.replace("thumbnail", "large")
-            elif "/orj360/" in pic_url:
-                pic_url = pic_url.replace("/orj360/", "/large/")
-
-            ext = ".jpg"
-            if ".png" in pic_url:
-                ext = ".png"
-            elif ".gif" in pic_url:
-                ext = ".gif"
-            filename = f"{bid or post_id}_{i}{ext}"
-            filepath = os.path.join(IMAGES_DIR, filename)
-
-            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                local_images.append(filepath)
-            elif download_image(pic_url, filepath):
-                local_images.append(filepath)
-                print(f"    Downloaded: {filename}")
-
-        image_map[post_id] = local_images
+            image_map[post_id] = enhanced_data[bid].get("local_images", [])
+        else:
+            image_map[post_id] = []
 
     total = sum(len(v) for v in image_map.values())
-    print(f"  Total images downloaded: {total}")
+    print(f"  Total images available: {total}")
     return image_map
 
 
@@ -609,7 +610,8 @@ def generate_pdf(html_content, pdf_path):
 
 
 # ==================== 邮件发送 ====================
-def send_email(attachments, new_count, total_count):
+def send_single_email(filepath, subject, body):
+    """Send a single email with one attachment"""
     if not SMTP_SERVER:
         print("    SMTP not configured, skipping email")
         return False
@@ -617,62 +619,64 @@ def send_email(attachments, new_count, total_count):
     msg = MIMEMultipart()
     msg["From"] = SMTP_USER
     msg["To"] = NOTIFY_EMAIL
-    now = datetime.datetime.now().strftime("%Y-%m-%d")
-
-    if new_count > 0:
-        subject = f"KK_szlife 微博更新 - 新增{new_count}条 - {now}"
-    else:
-        subject = f"KK_szlife 微博监控日报 - {now}"
     msg["Subject"] = subject
-
-    if new_count > 0:
-        body = f"""主人，您好！
-
-KK_szlife 微博监控报告已更新：
-
-- 新增微博：{new_count} 条
-- 累计微博：{total_count} 条
-- 检查时间：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-附件包含：
-1. 综合分析报告（含历史分析 + 新增内容 + 图片 + 截图 + 发布时间）
-2. 微博记录汇总（全部微博内容 + 图片 + 截图 + 发布时间）
-
-—— 小K
-"""
-    else:
-        body = f"""主人，您好！
-
-今日检查 KK_szlife 微博，暂无新增内容。
-
-- 累计微博：{total_count} 条
-- 检查时间：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-附件包含最新的综合分析报告和微博记录汇总（含图片、截图和发布时间），供参考。
-
-—— 小K
-"""
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
-    for filepath in attachments:
-        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-            filename = os.path.basename(filepath)
-            with open(filepath, "rb") as f:
-                part = MIMEBase("application", "pdf")
-                part.set_payload(f.read())
-                encoders.encode_base64(part)
-                encoded_filename = urllib.parse.quote(filename)
-                part.add_header("Content-Disposition", f'attachment; filename*=UTF-8\'\'{encoded_filename}')
-                msg.attach(part)
-            print(f"  Attached: {filename} ({os.path.getsize(filepath)//1024}KB)")
+    filename = os.path.basename(filepath)
+    with open(filepath, "rb") as f:
+        part = MIMEBase("application", "pdf")
+        part.set_payload(f.read())
+        encoders.encode_base64(part)
+        encoded_filename = urllib.parse.quote(filename)
+        part.add_header("Content-Disposition", f'attachment; filename*=UTF-8\'\'{encoded_filename}')
+        msg.attach(part)
 
-    print(f"  Connecting to {SMTP_SERVER}:{SMTP_PORT}...")
+    print(f"  Sending: {filename} ({os.path.getsize(filepath)//1024}KB)")
     server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
     server.login(SMTP_USER, SMTP_PASS)
-    print("  Login successful!")
     server.sendmail(SMTP_USER, NOTIFY_EMAIL, msg.as_string())
-    print("  Email sent successfully!")
     server.quit()
+    print(f"  Sent OK")
+    return True
+
+
+def send_email(attachments, new_count, total_count):
+    """Send emails with PDF attachments (one per email to avoid spam filters)"""
+    if not SMTP_SERVER:
+        print("    SMTP not configured, skipping email")
+        return False
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d")
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for i, filepath in enumerate(attachments):
+        if not (os.path.exists(filepath) and os.path.getsize(filepath) > 0):
+            continue
+
+        filename = os.path.basename(filepath)
+        if "analysis" in filename:
+            subject = f"Weibo Monitor Report {now}"
+            if new_count > 0:
+                body = f"Report: {new_count} new posts, {total_count} total.\nTime: {timestamp}\nAttachment: Analysis report with images and screenshots."
+            else:
+                body = f"Report: {total_count} posts monitored.\nTime: {timestamp}\nAttachment: Analysis report with images and screenshots."
+        else:
+            subject = f"Weibo Records {now}"
+            body = f"Records: {total_count} posts.\nTime: {timestamp}\nAttachment: Weibo records with images and screenshots."
+
+        try:
+            send_single_email(filepath, subject, body)
+            time.sleep(3)  # Delay between emails
+        except Exception as e:
+            print(f"  Email error: {e}")
+            # Retry with simpler content
+            try:
+                print(f"  Retrying with simplified content...")
+                send_single_email(filepath, f"Report {now}", f"See attachment.\n{timestamp}")
+                time.sleep(3)
+            except Exception as e2:
+                print(f"  Retry also failed: {e2}")
+
     return True
 
 
