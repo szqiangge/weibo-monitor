@@ -201,8 +201,9 @@ def enhance_posts_with_playwright(posts):
                     except:
                         page.screenshot(path=screenshot_path, full_page=False)
 
-                    # Download images using Playwright context (bypasses Referer issues)
+                    # Download images - try multiple methods
                     local_image_paths = []
+                    img_elements = page.query_selector_all('img[src*="sinaimg"]')
                     for img_idx, img_url in enumerate(data.get("images", [])):
                         ext = ".jpg"
                         if ".png" in img_url:
@@ -211,20 +212,60 @@ def enhance_posts_with_playwright(posts):
                             ext = ".gif"
                         img_filename = f"{bid}_{img_idx}{ext}"
                         img_filepath = os.path.join(IMAGES_DIR, img_filename)
-                        if not (os.path.exists(img_filepath) and os.path.getsize(img_filepath) > 0):
+
+                        if os.path.exists(img_filepath) and os.path.getsize(img_filepath) > 0:
+                            local_image_paths.append(img_filepath)
+                            continue
+
+                        download_ok = False
+
+                        # Method 1: context.request.get with Referer
+                        try:
+                            img_response = context.request.get(
+                                img_url,
+                                headers={"Referer": detail_url, "User-Agent": MOBILE_UA},
+                                timeout=10000
+                            )
+                            if img_response.ok:
+                                with open(img_filepath, "wb") as f:
+                                    f.write(img_response.body())
+                                local_image_paths.append(img_filepath)
+                                download_ok = True
+                                print(f"      Downloaded image: {img_filename}")
+                        except:
+                            pass
+
+                        # Method 2: screenshot the image element from the page
+                        if not download_ok and img_idx < len(img_elements):
                             try:
-                                img_response = context.request.get(img_url, timeout=10000)
+                                elem = img_elements[img_idx]
+                                elem.screenshot(path=img_filepath)
+                                if os.path.exists(img_filepath) and os.path.getsize(img_filepath) > 0:
+                                    local_image_paths.append(img_filepath)
+                                    download_ok = True
+                                    print(f"      Captured image element: {img_filename}")
+                            except:
+                                pass
+
+                        # Method 3: try with https://weibo.com/ as Referer
+                        if not download_ok:
+                            try:
+                                img_response = context.request.get(
+                                    img_url,
+                                    headers={"Referer": "https://weibo.com/", "User-Agent": MOBILE_UA},
+                                    timeout=10000
+                                )
                                 if img_response.ok:
                                     with open(img_filepath, "wb") as f:
                                         f.write(img_response.body())
                                     local_image_paths.append(img_filepath)
-                                    print(f"      Downloaded image: {img_filename}")
-                                else:
-                                    print(f"      Image download failed: {img_response.status}")
-                            except Exception as ie:
-                                print(f"      Image error: {ie}")
-                        else:
-                            local_image_paths.append(img_filepath)
+                                    download_ok = True
+                                    print(f"      Downloaded (weibo referer): {img_filename}")
+                            except:
+                                pass
+
+                        if not download_ok:
+                            print(f"      Image download failed: {img_url[:50]}...")
 
                     enhanced[bid] = {
                         "text": data.get("text", ""),
