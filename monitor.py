@@ -505,16 +505,18 @@ th {{ background: #f0f0f0; font-weight: bold; }}
         html += f"<tr><td>{i}</td><td>{pub}</td><td>{text}</td><td>{pic_count}张</td></tr>\n"
     html += "</table>\n<hr>\n"
 
-    # Historical analysis
-    html += "\n<h2>四、历史完整分析报告</h2>\n<blockquote>以下为此前完成的完整分析报告，供对比参考。</blockquote>\n<hr>\n"
+    # Historical analysis (truncated to keep PDF size under email limits)
+    html += "\n<h2>四、历史完整分析报告（摘要）</h2>\n<blockquote>以下为历史分析报告摘要，完整报告请见 GitHub 仓库。</blockquote>\n<hr>\n"
     if full_analysis:
         try:
             import markdown2
-            html_body = markdown2.markdown(full_analysis, extras=["tables", "fenced-code-blocks"])
+            # Truncate to first ~3000 chars to keep PDF size manageable
+            truncated = full_analysis[:3000]
+            if len(full_analysis) > 3000:
+                truncated += "\n\n[... 完整报告请见 GitHub 仓库: reports/KK_szlife_full_analysis.md ...]\n"
+            html_body = markdown2.markdown(truncated, extras=["tables", "fenced-code-blocks"])
         except ImportError:
-            html_body = full_analysis.replace("\n", "<br>\n")
-            html_body = re.sub(r'^# (.+)$', r'<h1>\1</h1>', html_body, flags=re.MULTILINE)
-            html_body = re.sub(r'^## (.+)$', r'<h2>\1</h2>', html_body, flags=re.MULTILINE)
+            html_body = full_analysis[:3000].replace("\n", "<br>\n")
         html += html_body
     else:
         html += "<p><em>暂无历史分析报告</em></p>\n"
@@ -599,6 +601,29 @@ hr {{ border: none; border-top: 1px solid #ccc; margin: 30px 0; }}
 
 
 # ==================== PDF 生成 ====================
+def compress_images(image_paths, max_width=800, quality=75):
+    """Compress images to reduce PDF size"""
+    try:
+        from PIL import Image
+    except ImportError:
+        print("    Pillow not available, skipping compression")
+        return
+
+    for path in image_paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            img = Image.open(path)
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+            if img.width > max_width:
+                ratio = max_width / img.width
+                img = img.resize((max_width, int(img.height * ratio)), Image.LANSOSZ if hasattr(Image, 'LANSOSZ') else Image.LANCZOS)
+            img.save(path, 'JPEG', quality=quality, optimize=True)
+        except Exception as e:
+            print(f"    Compression error for {path}: {e}")
+
+
 def find_chrome():
     candidates = [
         "google-chrome", "google-chrome-stable", "/usr/bin/google-chrome",
@@ -765,8 +790,18 @@ def main():
     save_records(records)
     print("\n[5] Records saved.")
 
-    # Step 6: Generate analysis report
-    print("\n[6] Generating combined analysis...")
+    # Step 6: Compress images then generate analysis report
+    print("\n[6] Compressing images...")
+    all_img_paths = []
+    for paths in image_map.values():
+        all_img_paths.extend(paths)
+    for ed in enhanced_data.values():
+        ss = ed.get("screenshot")
+        if ss:
+            all_img_paths.append(ss)
+    compress_images(all_img_paths)
+
+    print("\n[6b] Generating combined analysis...")
     full_analysis = load_full_analysis()
     analysis_html = generate_combined_analysis(full_analysis, new_posts, records["all_posts"], image_map, {}, enhanced_data)
 
