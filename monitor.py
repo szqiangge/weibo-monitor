@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-KK_szlife 微博监控脚本（增强版 v4.4）
+微博监控脚本（增强版 v4.6）
 - RSS 获取微博列表
 - Playwright 访问每条微博详情页，提取时间戳、图片URL、截图
 - 下载微博图片
 - 生成 PDF 分析报告（不含截图，体积更小）+ PDF 微博记录汇总（含图片和截图）
-- 通过邮件发送两份 PDF 附件（大文件自动回退为 GitHub 下载链接）
+- 通过邮件发送 PDF 附件（大文件自动回退为 GitHub 下载链接）
+- 邮件及 PDF 中不出现微博用户名，仅使用 UID 标识
 """
 
 import os
@@ -35,7 +36,7 @@ RECORDS_FILE = "weibo_records.json"
 REPORTS_DIR = "reports"
 IMAGES_DIR = "reports/images"
 SCREENSHOTS_DIR = "reports/screenshots"
-FULL_ANALYSIS_FILE = "reports/KK_szlife_full_analysis.md"
+FULL_ANALYSIS_FILE = "reports/full_analysis_2241280342.md"
 
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
@@ -430,9 +431,9 @@ th {{ background: #f0f0f0; font-weight: bold; }}
 </style>
 </head>
 <body>
-<h1>KK_szlife 微博综合分析报告（更新版）</h1>
+<h1>微博综合分析报告（UID: 2241280342）</h1>
 <p><strong>报告时间：</strong>{now}<br>
-<strong>监控用户：</strong>KK_szlife（UID: {WEIBO_UID}）<br>
+<strong>监控用户 UID：</strong>2241280342<br>
 <strong>累计微博总数：</strong>{len(all_posts)} 条<br>
 <strong>本次新增微博：</strong>{len(new_posts)} 条</p>
 <hr>
@@ -515,7 +516,7 @@ th {{ background: #f0f0f0; font-weight: bold; }}
             # Truncate to first ~1500 chars to keep PDF size manageable for email
             truncated = full_analysis[:1500]
             if len(full_analysis) > 1500:
-                truncated += "\n\n[... 完整报告请见 GitHub 仓库: reports/KK_szlife_full_analysis.md ...]\n"
+                truncated += "\n\n[... 完整报告请见 GitHub 仓库: reports/full_analysis_2241280342.md ...]\n"
             html_body = markdown2.markdown(truncated, extras=["tables", "fenced-code-blocks"])
         except ImportError:
             html_body = full_analysis[:3000].replace("\n", "<br>\n")
@@ -553,9 +554,9 @@ hr {{ border: none; border-top: 1px solid #ccc; margin: 30px 0; }}
 </style>
 </head>
 <body>
-<h1>KK_szlife 微博记录汇总</h1>
+<h1>微博记录汇总（UID: 2241280342）</h1>
 <p><strong>生成时间：</strong>{now}<br>
-<strong>监控用户：</strong>KK_szlife（UID: {WEIBO_UID}）<br>
+<strong>监控用户 UID：</strong>2241280342<br>
 <strong>微博总数：</strong>{len(all_posts)} 条</p>
 <hr>
 """
@@ -764,19 +765,20 @@ def send_email(attachments, new_count, total_count):
         print("    No PDFs to send")
         return False
 
-    subject = f"Weibo Monitor {now}"
+    subject = f"微博监控报告 2241280342 {now}"
     attach_size = os.path.getsize(attach_pdf) // 1024 if attach_pdf else 0
     body_lines = [
-        f"Report: {new_count} new posts, {total_count} total.",
-        f"Time: {timestamp}",
+        f"监控用户 UID: 2241280342",
+        f"新增微博: {new_count} 条, 总计: {total_count} 条",
+        f"时间: {timestamp}",
         "",
     ]
 
     if attach_pdf:
-        body_lines.append(f"Attached: {os.path.basename(attach_pdf)} ({attach_size}KB)")
+        body_lines.append(f"附件: {os.path.basename(attach_pdf)} ({attach_size}KB)")
     if link_pdf:
         link_size = os.path.getsize(link_pdf) // 1024
-        body_lines.append(f"Analysis report ({link_size}KB): {github_url(link_pdf)}")
+        body_lines.append(f"分析报告下载 ({link_size}KB): {github_url(link_pdf)}")
 
     body = "\n".join(body_lines)
 
@@ -802,7 +804,12 @@ def send_email(attachments, new_count, total_count):
     print(f"  Waiting 60s before fallback...")
     time.sleep(60)
 
-    fallback_lines = [f"Report: {new_count} new posts, {total_count} total.", f"Time: {timestamp}", ""]
+    fallback_lines = [
+        f"监控用户 UID: 2241280342",
+        f"新增微博: {new_count} 条, 总计: {total_count} 条",
+        f"时间: {timestamp}",
+        "",
+    ]
     for f in [analysis_pdf, records_pdf]:
         if f:
             size_kb = os.path.getsize(f) // 1024
@@ -811,7 +818,7 @@ def send_email(attachments, new_count, total_count):
     fallback_body = "\n".join(fallback_lines)
 
     try:
-        send_text_email(f"Weibo Monitor Links {now}", fallback_body)
+        send_text_email(f"微博监控下载链接 2241280342 {now}", fallback_body)
         print(f"  Fallback text email sent!")
         return True
     except Exception as e:
@@ -823,7 +830,7 @@ def send_email(attachments, new_count, total_count):
 # ==================== 主程序 ====================
 def main():
     print("=" * 60)
-    print(f"KK_szlife 微博监控 - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"微博监控 UID:2241280342 - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
     os.makedirs(REPORTS_DIR, exist_ok=True)
