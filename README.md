@@ -1,2 +1,48 @@
-# weibo-monitor
-KK_szlife 微博每日监控
+# KK_szlife 微博云端监控系统
+
+通过 GitHub Actions 每日自动监控微博用户 KK_szlife（UID: 2241280342）的更新，不依赖本地电脑开机。
+
+## 工作原理
+
+1. **每天北京时间 10:00**，GitHub Actions 自动启动
+2. 脚本通过 RSSHub 源抓取 KK_szlife 的最新微博
+3. 对比上次记录，找出新增微博
+4. 如果有新微博，自动发送邮件通知（含微博全文和链接）
+5. 监控记录自动提交回仓库，持久保存
+
+## 首次运行
+
+首次运行时会将当前所有可见微博作为基线记录，并发送一封"监控已启动"的确认邮件。之后仅在有新微博时发送通知。
+
+## 文件结构
+
+```
+weibo-monitor-github/
+├── .github/
+│   └── workflows/
+│       └── monitor.yml      # GitHub Actions 定时任务配置
+├── monitor.py               # 监控脚本
+├── weibo_records.json        # 监控记录（自动生成）
+├── reports/                  # 历史报告目录（自动生成）
+└── README.md                 # 说明文件
+```
+
+## 需要配置的 GitHub Secrets
+
+在仓库 Settings → Secrets and variables → Actions 中添加：
+
+| Secret 名称 | 说明 | 本项目填写的值 |
+|-------------|------|----------------|
+| SMTP_SERVER | SMTP 服务器地址 | smtp.139.com |
+| SMTP_PORT | SMTP 端口 | 465 |
+| SMTP_USER | 发件邮箱地址 | 13902474300@139.com |
+| SMTP_PASS | 邮箱授权码（非登录密码） | （139邮箱授权码） |
+| NOTIFY_EMAIL | 接收通知的邮箱 | 13902474300@139.com |
+
+## 手动触发
+
+在仓库 Actions 页面，选择 "每日监控 KK_szlife 微博" 工作流，点击 "Run workflow" 可手动触发一次检查。
+
+## 费用
+
+GitHub Actions 对公开仓库免费提供，每月 2000 分钟额度，本任务每天约消耗 1 分钟，完全免费。
