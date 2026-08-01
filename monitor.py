@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-微博监控脚本（增强版 v5.0）
+微博监控脚本（增强版 v5.1）
 - PC端 RSS + 移动端 m.weibo.cn API 双端获取微博列表，合并去重
 - Playwright 访问每条微博详情页，提取时间戳、图片URL、截图
+- 删除检测：对比历史记录，验证未出现的近期微博是否被删除/隐藏
 - 下载微博图片
 - 结合个人生活深度分析报告（终极版）进行交叉分析
-- 生成 PDF 分析报告（含交叉分析）+ PDF 微博记录汇总（含图片和截图）
+- 生成 PDF 分析报告（含交叉分析+删除检测）+ PDF 微博记录汇总（含图片和截图）
 - 截图PDF和分析报告分别通过邮件发送
 - 邮件及 PDF 中不出现微博用户名，仅使用 UID 标识
 """
@@ -433,8 +434,11 @@ def download_all_images(posts, enhanced_data):
 def load_records():
     if os.path.exists(RECORDS_FILE):
         with open(RECORDS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"known_guids": [], "last_check": None, "all_posts": []}
+            data = json.load(f)
+            if "deleted_posts" not in data:
+                data["deleted_posts"] = []
+            return data
+    return {"known_guids": [], "last_check": None, "all_posts": [], "deleted_posts": []}
 
 
 def save_records(records):
@@ -442,25 +446,169 @@ def save_records(records):
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 
+def detect_deleted_posts(records, current_bids):
+    """
+    Detect posts that were previously seen but may have been deleted/hidden.
+    Checks posts not in current fetch by visiting their m.weibo.cn detail pages.
+    Returns: list of newly detected deleted posts.
+    """
+    if "deleted_posts" not in records:
+        records["deleted_posts"] = []
+
+    already_deleted_bids = {p.get("bid") for p in records["deleted_posts"]}
+
+    # Find posts to check: in history, not in current fetch, not already confirmed deleted
+    to_check = []
+    now = datetime.datetime.now()
+    for post in records.get("all_posts", []):
+        bid = post.get("bid", "")
+        if not bid or bid in current_bids or bid in already_deleted_bids:
+            continue
+        if post.get("deleted"):
+            continue
+
+        # Only check posts from the last 30 days
+        last_seen = post.get("last_seen", post.get("first_seen", ""))
+        if last_seen:
+            try:
+                seen_date = datetime.datetime.strptime(last_seen, "%Y-%m-%d %H:%M:%S")
+                if (now - seen_date).days > 30:
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        to_check.append(post)
+
+    if not to_check:
+        print("    No posts to check for deletion")
+        return []
+
+    # Sort by last_seen descending (check most recent first)
+    to_check.sort(key=lambda p: p.get("last_seen", p.get("first_seen", "")), reverse=True)
+
+    # Limit checks to avoid timeout
+    max_checks = 20
+    if len(to_check) > max_checks:
+        print(f"    {len(to_check)} posts to check, limiting to {max_checks} most recent")
+        to_check = to_check[:max_checks]
+
+    print(f"    Checking {len(to_check)} posts for deletion...")
+
+    newly_deleted = []
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("    Playwright not installed, skipping deletion check")
+        return newly_deleted
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+            context = browser.new_context(
+                viewport={"width": 420, "height": 900},
+                user_agent=MOBILE_UA,
+                device_scale_factor=2,
+                locale="zh-CN",
+            )
+            page = context.new_page()
+
+            for post in to_check:
+                bid = post.get("bid", "")
+                detail_url = f"https://m.weibo.cn/detail/{bid}"
+                print(f"    Checking {bid}...")
+
+                try:
+                    page.goto(detail_url, timeout=15000, wait_until="networkidle")
+                    time.sleep(2)
+
+                    page_text = page.inner_text("body")
+
+                    deletion_indicators = [
+                        "微博不存在", "已删除", "该微博已被删除",
+                        "抱歉", "内容不存在", "已被作者删除",
+                        "该账号已关闭", "该微博已删除", "暂时无法查看",
+                    ]
+
+                    is_deleted = any(indicator in page_text for indicator in deletion_indicators)
+
+                    if is_deleted:
+                        # Take screenshot as evidence
+                        screenshot_path = os.path.join(SCREENSHOTS_DIR, f"deleted_{bid}.png")
+                        try:
+                            page.screenshot(path=screenshot_path, full_page=False)
+                        except Exception:
+                            screenshot_path = None
+
+                        deletion_info = {
+                            "bid": bid,
+                            "text": post.get("text", ""),
+                            "link": post.get("link", ""),
+                            "pub_date": post.get("pub_date", ""),
+                            "first_seen": post.get("first_seen", ""),
+                            "last_seen": post.get("last_seen", ""),
+                            "deleted_detected": now.strftime("%Y-%m-%d %H:%M:%S"),
+                            "screenshot": screenshot_path,
+                        }
+
+                        records["deleted_posts"].append(deletion_info)
+                        newly_deleted.append(deletion_info)
+
+                        # Mark in all_posts too
+                        post["deleted"] = True
+                        post["deleted_detected"] = now.strftime("%Y-%m-%d %H:%M:%S")
+
+                        text_preview = post.get("text", "")[:40]
+                        print(f"      DELETED: {bid} - {text_preview}...")
+                    else:
+                        post["last_verified"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"      Still exists: {bid}")
+
+                except Exception as e:
+                    print(f"      Check failed for {bid}: {e}")
+
+            browser.close()
+    except Exception as e:
+        print(f"    Deletion check error: {e}")
+
+    print(f"    Deletion check complete: {len(newly_deleted)} newly deleted, {len(to_check) - len(newly_deleted)} still exist")
+    return newly_deleted
+
+
 def find_new_posts(records, posts):
     known = set(records["known_guids"])
     new_posts = []
+    current_bids = set()
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     for post in posts:
         guid = post.get("link") or post.get("id") or post.get("text", "")[:50]
+        bid = post.get("bid", "")
+        if bid:
+            current_bids.add(bid)
+
         if guid not in known:
             new_posts.append(post)
             records["known_guids"].append(guid)
             records["all_posts"].append({
                 "id": post.get("id", ""),
-                "bid": post.get("bid", ""),
+                "bid": bid,
                 "title": post.get("text", "")[:80],
                 "text": post.get("text", ""),
                 "link": post.get("link", ""),
                 "pub_date": post.get("pub_time", ""),
                 "pics": post.get("pics", []),
-                "first_seen": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "first_seen": now_str,
+                "last_seen": now_str,
             })
-    return new_posts
+        else:
+            # Update last_seen for existing posts
+            for stored in records["all_posts"]:
+                if (bid and stored.get("bid") == bid) or stored.get("link") == post.get("link"):
+                    stored["last_seen"] = now_str
+                    break
+
+    return new_posts, current_bids
 
 
 # ==================== 分析报告生成 ====================
@@ -503,7 +651,7 @@ def cross_analyze_with_deep_report(new_posts, deep_analysis):
         if found:
             matches[dimension] = found
 
-    html = '<h2>三、与个人生活深度分析报告交叉分析</h2>\n'
+    html = '<h2>四、与个人生活深度分析报告交叉分析</h2>\n'
 
     if not new_posts:
         html += "<p><em>本次无新增微博，跳过交叉分析。</em></p>\n"
@@ -512,7 +660,7 @@ def cross_analyze_with_deep_report(new_posts, deep_analysis):
     html += '<blockquote>以下分析基于个人生活深度分析报告（终极版）的12维度主题挖掘与心理画像，对新微博内容进行交叉比对。</blockquote>\n'
 
     # 1. User profile comparison
-    html += '<h3>3.1 用户画像比对</h3>\n'
+    html += '<h3>4.1 用户画像比对</h3>\n'
     if "婚姻状态" in matches:
         html += f'<p>新微博涉及<strong>婚姻状态</strong>相关内容（关键词：{", ".join(matches["婚姻状态"])}），'
         if "事实离婚" in all_new_text or "保持家庭完整" in all_new_text:
@@ -523,7 +671,7 @@ def cross_analyze_with_deep_report(new_posts, deep_analysis):
         html += '<p>新微博未直接涉及婚姻状态主题。</p>\n'
 
     # 2. Emotional trend comparison
-    html += '<h3>3.2 情绪趋势对比</h3>\n'
+    html += '<h3>4.2 情绪趋势对比</h3>\n'
     positive_words = ["开心", "快乐", "幸福", "美好", "温暖", "喜欢", "爱", "感谢", "感恩", "希望", "期待", "释然", "平静", "安心"]
     negative_words = ["难过", "伤心", "遗憾", "泪", "哭", "痛苦", "荒凉", "冷", "孤独", "寂寞", "失去", "结束", "再见"]
     found_pos = [w for w in positive_words if w in all_new_text]
@@ -540,7 +688,7 @@ def cross_analyze_with_deep_report(new_posts, deep_analysis):
         html += '与深度分析报告中"理性化应对"的心理画像一致——将痛苦转化为哲理。</p>\n'
 
     # 3. Interest domain mapping
-    html += '<h3>3.3 兴趣领域映射</h3>\n'
+    html += '<h3>4.3 兴趣领域映射</h3>\n'
     domain_matches = []
     if "情感对象" in matches:
         domain_matches.append(f'爱情/思念（关键词：{", ".join(matches["情感对象"])}）')
@@ -557,7 +705,7 @@ def cross_analyze_with_deep_report(new_posts, deep_analysis):
         html += '<p>新微博未明显涉及深度分析报告中的核心主题领域，可能出现了<strong>新的兴趣方向</strong>。</p>\n'
 
     # 4. New information discovery
-    html += '<h3>3.4 新信息发现</h3>\n'
+    html += '<h3>4.4 新信息发现</h3>\n'
     deep_themes = ["事实离婚", "保持家庭完整", "鹏", "老铁", "姐们", "蜜蜜", "深圳", "南山", "东山岛"]
     new_info = [kw for kw in deep_themes if kw not in deep_analysis[:200] or kw not in all_new_text]
     html += '<p>基于深度分析报告框架，新微博'
@@ -568,7 +716,7 @@ def cross_analyze_with_deep_report(new_posts, deep_analysis):
     html += '建议结合微博原文和深度分析报告进行综合判断。</p>\n'
 
     # 5. Deep interpretation
-    html += '<h3>3.5 深度解读与预判</h3>\n'
+    html += '<h3>4.5 深度解读与预判</h3>\n'
     html += '<blockquote>'
     if "情感对象" in matches and ("酒" in all_new_text or "饮" in all_new_text):
         html += '新微博在饮酒场景中再次提及情感对象，与深度分析报告中"避不开的你"的模式一致——即使事实离婚后，'
@@ -584,7 +732,7 @@ def cross_analyze_with_deep_report(new_posts, deep_analysis):
     return html
 
 
-def generate_combined_analysis(full_analysis, deep_analysis, new_posts, all_posts, image_map, screenshots, enhanced_data):
+def generate_combined_analysis(full_analysis, deep_analysis, new_posts, all_posts, image_map, screenshots, enhanced_data, newly_deleted=None, all_deleted=None):
     """Generate combined analysis report as HTML"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -647,7 +795,9 @@ th {{ background: #f0f0f0; font-weight: bold; }}
 <p><strong>报告时间：</strong>{now}<br>
 <strong>监控用户 UID：</strong>2241280342<br>
 <strong>累计微博总数：</strong>{len(all_posts)} 条<br>
-<strong>本次新增微博：</strong>{len(new_posts)} 条</p>
+<strong>本次新增微博：</strong>{len(new_posts)} 条<br>
+<strong>本次检测到删除：</strong>{len(newly_deleted) if newly_deleted else 0} 条<br>
+<strong>累计已删除微博：</strong>{len(all_deleted) if all_deleted else 0} 条</p>
 <hr>
 <h2>一、情绪分析</h2>
 <p><strong>情绪基调：</strong><span class="mood-badge {mood_class}">{mood}</span></p>
@@ -704,12 +854,40 @@ th {{ background: #f0f0f0; font-weight: bold; }}
     else:
         html += "<p><em>本次检查无新增微博，以下为已有微博的汇总分析。</em></p>\n<hr>\n"
 
+    # Deletion detection section
+    html += "\n<h2>三、删除检测报告</h2>\n"
+    if newly_deleted:
+        html += f'<p><strong>本次检测到 {len(newly_deleted)} 条微博被删除/隐藏：</strong></p>\n'
+        html += '<table>\n<tr><th>#</th><th>原文链接</th><th>内容摘要</th><th>首次抓取</th><th>最后见到</th><th>删除检测时间</th></tr>\n'
+        for i, d in enumerate(newly_deleted, 1):
+            text_preview = (d.get("text", "") or "")[:50]
+            if len(d.get("text", "")) > 50:
+                text_preview += "..."
+            link = d.get("link", "")
+            html += f'<tr><td>{i}</td><td><a href="{link}">{d.get("bid", "")}</a></td><td>{text_preview}</td><td>{d.get("first_seen", "")}</td><td>{d.get("last_seen", "")}</td><td>{d.get("deleted_detected", "")}</td></tr>\n'
+        html += "</table>\n"
+        html += '<blockquote>以上微博在历史监控中曾被抓取，但本次检测时其详情页已显示"微博不存在"或"已删除"。这表明用户主动删除或隐藏了这些微博。系统已保存原始抓取记录及删除证据截图。</blockquote>\n'
+    else:
+        html += "<p>本次检测未发现微博被删除或隐藏。</p>\n"
+
+    if all_deleted and len(all_deleted) > 0:
+        html += f'\n<h3>3.1 累计删除记录（共 {len(all_deleted)} 条）</h3>\n'
+        html += '<table>\n<tr><th>#</th><th>原文链接</th><th>内容摘要</th><th>删除检测时间</th></tr>\n'
+        for i, d in enumerate(all_deleted, 1):
+            text_preview = (d.get("text", "") or "")[:50]
+            if len(d.get("text", "")) > 50:
+                text_preview += "..."
+            link = d.get("link", "")
+            html += f'<tr><td>{i}</td><td><a href="{link}">{d.get("bid", "")}</a></td><td>{text_preview}</td><td>{d.get("deleted_detected", "")}</td></tr>\n'
+        html += "</table>\n"
+    html += "<hr>\n"
+
     # Cross-analysis with deep analysis report
     html += cross_analyze_with_deep_report(new_posts, deep_analysis)
     html += "<hr>\n"
 
     # All posts summary
-    html += "\n<h2>四、全部微博记录汇总</h2>\n<table>\n<tr><th>#</th><th>发布时间</th><th>内容摘要</th><th>图片</th></tr>\n"
+    html += "\n<h2>五、全部微博记录汇总</h2>\n<table>\n<tr><th>#</th><th>发布时间</th><th>内容摘要</th><th>图片</th></tr>\n"
     for i, post in enumerate(all_posts, 1):
         text = (post.get("text", "") or post.get("title", ""))[:50]
         pub = post.get("pub_date", "") or post.get("first_seen", "")
@@ -725,7 +903,7 @@ th {{ background: #f0f0f0; font-weight: bold; }}
     html += "</table>\n<hr>\n"
 
     # Historical analysis (truncated to keep PDF size under email limits)
-    html += "\n<h2>五、历史完整分析报告（摘要）</h2>\n<blockquote>以下为历史分析报告摘要，完整报告请见 GitHub 仓库。</blockquote>\n<hr>\n"
+    html += "\n<h2>六、历史完整分析报告（摘要）</h2>\n<blockquote>以下为历史分析报告摘要，完整报告请见 GitHub 仓库。</blockquote>\n<hr>\n"
     if full_analysis:
         try:
             import markdown2
@@ -744,7 +922,7 @@ th {{ background: #f0f0f0; font-weight: bold; }}
     return html
 
 
-def generate_weibo_records_html(all_posts, image_map, enhanced_data):
+def generate_weibo_records_html(all_posts, image_map, enhanced_data, deleted_posts=None):
     """Generate weibo records as HTML with images and screenshots"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -814,6 +992,31 @@ hr {{ border: none; border-top: 1px solid #ccc; margin: 30px 0; }}
                 html += f'<div class="weibo-screenshot"><h4>微博页面截图</h4><img src="file://{os.path.abspath(screenshot)}" alt="截图"></div>\n'
 
         html += '</div>\n<hr>\n'
+
+    # Deleted posts section
+    if deleted_posts:
+        html += f'\n<h2>已删除/隐藏微博记录（共 {len(deleted_posts)} 条）</h2>\n'
+        html += '<blockquote>以下微博曾被监控抓取，后经检测确认已被用户删除或隐藏。系统保留了原始抓取内容及删除证据截图。</blockquote>\n'
+        for i, d in enumerate(deleted_posts, 1):
+            text = d.get("text", "")
+            link = d.get("link", "")
+            bid = d.get("bid", "")
+            pub = d.get("pub_date", "") or d.get("first_seen", "")
+            detected = d.get("deleted_detected", "")
+
+            html += f'<div class="weibo-card" style="border-color: #e74c3c;">\n'
+            html += f'<div class="weibo-header">\n'
+            html += f'<span class="weibo-time">#{i} 已删除 | 原发布时间：{pub or "未知"} | 删除检测：{detected}</span>\n'
+            html += f'<span style="font-size:0.85em;"><a href="{link}">原文链接</a></span>\n'
+            html += f'</div>\n'
+            html += f'<div class="weibo-text" style="color: #999;">{text}</div>\n'
+
+            # Deletion evidence screenshot
+            screenshot = d.get("screenshot")
+            if screenshot and os.path.exists(screenshot):
+                html += f'<div class="weibo-screenshot"><h4>删除证据截图</h4><img src="file://{os.path.abspath(screenshot)}" alt="删除证据"></div>\n'
+
+            html += '</div>\n<hr>\n'
 
     html += "\n</body>\n</html>"
     return html
@@ -1069,7 +1272,7 @@ def main():
     # Step 4: Load records and find new posts
     print("\n[4] Comparing with records...")
     records = load_records()
-    new_posts = find_new_posts(records, posts)
+    new_posts, current_bids = find_new_posts(records, posts)
     records["last_check"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"    New posts: {len(new_posts)}")
     print(f"    Total known posts: {len(records['known_guids'])}")
@@ -1083,6 +1286,12 @@ def main():
                 stored["pub_date"] = ed["time"]
             if ed.get("images") and not stored.get("pics"):
                 stored["pics"] = ed["images"]
+
+    # Step 4b: Detect deleted posts
+    print("\n[4b] Checking for deleted posts...")
+    newly_deleted = detect_deleted_posts(records, current_bids)
+    if newly_deleted:
+        print(f"    *** {len(newly_deleted)} posts detected as DELETED/hidden ***")
 
     save_records(records)
     print("\n[5] Records saved.")
@@ -1101,7 +1310,7 @@ def main():
     print("\n[6b] Generating combined analysis...")
     full_analysis = load_full_analysis()
     deep_analysis = load_deep_analysis()
-    analysis_html = generate_combined_analysis(full_analysis, deep_analysis, new_posts, records["all_posts"], image_map, {}, enhanced_data)
+    analysis_html = generate_combined_analysis(full_analysis, deep_analysis, new_posts, records["all_posts"], image_map, {}, enhanced_data, newly_deleted, records.get("deleted_posts", []))
 
     now_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     analysis_pdf = f"{REPORTS_DIR}/analysis_{now_str}.pdf"
@@ -1112,7 +1321,7 @@ def main():
 
     # Step 7: Generate weibo records
     print("\n[7] Generating weibo records...")
-    records_html = generate_weibo_records_html(records["all_posts"], image_map, enhanced_data)
+    records_html = generate_weibo_records_html(records["all_posts"], image_map, enhanced_data, records.get("deleted_posts", []))
     records_pdf = f"{REPORTS_DIR}/weibo_records_{now_str}.pdf"
     if generate_pdf(records_html, records_pdf):
         print(f"    Records PDF: {records_pdf} ({os.path.getsize(records_pdf)//1024}KB)")
@@ -1124,11 +1333,13 @@ def main():
     now_date = datetime.datetime.now().strftime("%Y-%m-%d")
     new_count = len(new_posts)
     total_count = len(records["known_guids"])
+    deleted_count = len(newly_deleted) if newly_deleted else 0
+    total_deleted = len(records.get("deleted_posts", []))
 
     # Email 1: Screenshots/Records PDF
     if records_pdf and os.path.exists(records_pdf):
         subject1 = f"KK_szlife 微博截图更新 {now_date}"
-        body1 = f"监控用户 UID: 2241280342\n新增微博: {new_count} 条, 总计: {total_count} 条\n日期: {now_date}\n\n附件为本次监控的微博记录汇总（含截图和图片）。"
+        body1 = f"监控用户 UID: 2241280342\n新增微博: {new_count} 条, 总计: {total_count} 条\n删除检测: {deleted_count} 条新删除, 累计 {total_deleted} 条已删除\n日期: {now_date}\n\n附件为本次监控的微博记录汇总（含截图和图片）。"
         try:
             send_single_email(records_pdf, subject1, body1)
             print(f"    Screenshots email sent: {os.path.basename(records_pdf)}")
@@ -1146,7 +1357,7 @@ def main():
     # Email 2: Analysis Report PDF
     if analysis_pdf and os.path.exists(analysis_pdf):
         subject2 = f"KK_szlife 微博监控分析报告 {now_date}"
-        body2 = f"监控用户 UID: 2241280342\n新增微博: {new_count} 条, 总计: {total_count} 条\n日期: {now_date}\n\n附件为本次监控的综合分析报告，包含情绪分析、与个人生活深度分析报告的交叉分析等。"
+        body2 = f"监控用户 UID: 2241280342\n新增微博: {new_count} 条, 总计: {total_count} 条\n删除检测: {deleted_count} 条新删除, 累计 {total_deleted} 条已删除\n日期: {now_date}\n\n附件为本次监控的综合分析报告，包含情绪分析、删除检测、与个人生活深度分析报告的交叉分析等。"
         try:
             send_single_email(analysis_pdf, subject2, body2)
             print(f"    Analysis report email sent: {os.path.basename(analysis_pdf)}")
@@ -1162,13 +1373,20 @@ def main():
         print("    No analysis PDF to send")
 
     # If no new posts, still send a notification email
-    if new_count == 0:
+    if new_count == 0 and deleted_count == 0:
         try:
             send_text_email(f"KK_szlife 微博监控报告 {now_date}（无新增）",
-                f"监控用户 UID: 2241280342\n日期: {now_date}\n\n本次检查无新增微博。")
+                f"监控用户 UID: 2241280342\n日期: {now_date}\n\n本次检查无新增微博，未检测到删除。")
             print("    No-update notification email sent")
         except Exception as e:
             print(f"    No-update notification failed: {e}")
+    elif new_count == 0 and deleted_count > 0:
+        try:
+            send_text_email(f"KK_szlife 微博监控报告 {now_date}（无新增，检测到 {deleted_count} 条删除）",
+                f"监控用户 UID: 2241280342\n日期: {now_date}\n\n本次检查无新增微博，但检测到 {deleted_count} 条微博被删除/隐藏。\n累计已删除: {total_deleted} 条\n\n详见分析报告PDF。")
+            print(f"    Deletion notification email sent ({deleted_count} deleted)")
+        except Exception as e:
+            print(f"    Deletion notification failed: {e}")
 
     # Cleanup
     for f in Path(REPORTS_DIR).glob("*.html"):
