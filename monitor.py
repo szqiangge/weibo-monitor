@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-微博监控脚本（增强版 v4.6）
-- RSS 获取微博列表
+微博监控脚本（增强版 v5.0）
+- PC端 RSS + 移动端 m.weibo.cn API 双端获取微博列表，合并去重
 - Playwright 访问每条微博详情页，提取时间戳、图片URL、截图
 - 下载微博图片
-- 生成 PDF 分析报告（不含截图，体积更小）+ PDF 微博记录汇总（含图片和截图）
-- 通过邮件发送 PDF 附件（大文件自动回退为 GitHub 下载链接）
+- 结合个人生活深度分析报告（终极版）进行交叉分析
+- 生成 PDF 分析报告（含交叉分析）+ PDF 微博记录汇总（含图片和截图）
+- 截图PDF和分析报告分别通过邮件发送
 - 邮件及 PDF 中不出现微博用户名，仅使用 UID 标识
 """
 
@@ -37,6 +38,7 @@ REPORTS_DIR = "reports"
 IMAGES_DIR = "reports/images"
 SCREENSHOTS_DIR = "reports/screenshots"
 FULL_ANALYSIS_FILE = "reports/full_analysis_2241280342.md"
+DEEP_ANALYSIS_FILE = "reports/deep_analysis_2241280342.md"
 
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
@@ -102,6 +104,103 @@ def fetch_all_posts():
             "link": link,
             "source": "rss",
         })
+
+    # Merge mobile API data
+    mobile_posts = fetch_mobile_api()
+    if mobile_posts:
+        existing_ids = {p.get("bid") or p.get("id") for p in posts}
+        for mp in mobile_posts:
+            mid = mp.get("bid") or mp.get("id")
+            if mid and mid not in existing_ids:
+                posts.append(mp)
+                print(f"    Mobile API added unique post: {mid}")
+        print(f"    RSS: {len(all_items)} posts, Mobile API: {len(mobile_posts)} posts, Merged: {len(posts)} posts")
+
+    return posts
+
+
+# ==================== 移动端 API ====================
+def fetch_mobile_api():
+    """Fetch posts from m.weibo.cn API (getIndex endpoint)"""
+    url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={WEIBO_UID}"
+    posts = []
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": MOBILE_UA,
+            "Referer": f"https://m.weibo.cn/u/{WEIBO_UID}",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        cards = data.get("data", {}).get("cards", [])
+        for card in cards:
+            if card.get("card_type") == 9:
+                mblog = card.get("mblog", {})
+                if not mblog:
+                    continue
+                bid = mblog.get("bid", "")
+                mid = mblog.get("id", "")
+                text_raw = mblog.get("text", "")
+                text_clean = re.sub(r'<[^>]+>', '', text_raw).strip()
+                created_at = mblog.get("created_at", "")
+                source = mblog.get("source", "")
+                reposts = mblog.get("reposts_count", 0)
+                comments = mblog.get("comments_count", 0)
+                attitudes = mblog.get("attitudes_count", 0)
+                pics = [p.get("large", {}).get("url", "") for p in mblog.get("pics", [])]
+
+                post = {
+                    "id": str(mid) or bid,
+                    "bid": bid,
+                    "text": text_clean,
+                    "pub_time": created_at,
+                    "pics": pics,
+                    "link": f"https://m.weibo.cn/detail/{bid}" if bid else "",
+                    "source": "mobile_api",
+                    "reposts_count": reposts,
+                    "comments_count": comments,
+                    "attitudes_count": attitudes,
+                    "source_device": source,
+                }
+                posts.append(post)
+            elif card.get("card_type") == 11:
+                # card group - may contain nested cards
+                for sub_card in card.get("card_group", []):
+                    if sub_card.get("card_type") == 9:
+                        mblog = sub_card.get("mblog", {})
+                        if not mblog:
+                            continue
+                        bid = mblog.get("bid", "")
+                        mid = mblog.get("id", "")
+                        text_raw = mblog.get("text", "")
+                        text_clean = re.sub(r'<[^>]+>', '', text_raw).strip()
+                        created_at = mblog.get("created_at", "")
+                        source = mblog.get("source", "")
+                        reposts = mblog.get("reposts_count", 0)
+                        comments = mblog.get("comments_count", 0)
+                        attitudes = mblog.get("attitudes_count", 0)
+                        pics = [p.get("large", {}).get("url", "") for p in mblog.get("pics", [])]
+
+                        post = {
+                            "id": str(mid) or bid,
+                            "bid": bid,
+                            "text": text_clean,
+                            "pub_time": created_at,
+                            "pics": pics,
+                            "link": f"https://m.weibo.cn/detail/{bid}" if bid else "",
+                            "source": "mobile_api",
+                            "reposts_count": reposts,
+                            "comments_count": comments,
+                            "attitudes_count": attitudes,
+                            "source_device": source,
+                        }
+                        posts.append(post)
+
+        print(f"    Mobile API: fetched {len(posts)} posts")
+    except Exception as e:
+        print(f"    Mobile API error: {e}")
+
     return posts
 
 
@@ -372,7 +471,120 @@ def load_full_analysis():
     return ""
 
 
-def generate_combined_analysis(full_analysis, new_posts, all_posts, image_map, screenshots, enhanced_data):
+def load_deep_analysis():
+    """Load the personal life deep analysis report (ultimate version)"""
+    if os.path.exists(DEEP_ANALYSIS_FILE):
+        with open(DEEP_ANALYSIS_FILE, "r", encoding="utf-8") as f:
+            return f.read()
+    return ""
+
+
+def cross_analyze_with_deep_report(new_posts, deep_analysis):
+    """Cross-analyze new posts with the deep analysis report"""
+    if not deep_analysis:
+        return "<p><em>个人生活深度分析报告未找到，跳过交叉分析。</em></p>"
+
+    # Extract key dimensions from deep analysis
+    deep_keywords = {
+        "婚姻状态": ["事实离婚", "保持家庭完整", "空壳婚姻", "婚姻", "老公", "鹏爸"],
+        "情感对象": ["避不开的你", "你", "放弃你", "绝不再", "不愿意了"],
+        "情绪基调": ["稳定平常心", "苦涩", "清醒", "平衡", "释然", "消磨殆尽"],
+        "应对机制": ["酒", "饮酒", "喝", "深夜", "独白", "孤独"],
+        "文学表达": ["花", "月", "风", "酒", "梦", "泪", "山河"],
+        "家庭角色": ["鹏", "亲子", "老豆老妈", "家族"],
+    }
+
+    new_texts = [p.get("text", "") or p.get("title", "") for p in new_posts]
+    all_new_text = " ".join(new_texts)
+
+    matches = {}
+    for dimension, keywords in deep_keywords.items():
+        found = [kw for kw in keywords if kw in all_new_text]
+        if found:
+            matches[dimension] = found
+
+    html = '<h2>三、与个人生活深度分析报告交叉分析</h2>\n'
+
+    if not new_posts:
+        html += "<p><em>本次无新增微博，跳过交叉分析。</em></p>\n"
+        return html
+
+    html += '<blockquote>以下分析基于个人生活深度分析报告（终极版）的12维度主题挖掘与心理画像，对新微博内容进行交叉比对。</blockquote>\n'
+
+    # 1. User profile comparison
+    html += '<h3>3.1 用户画像比对</h3>\n'
+    if "婚姻状态" in matches:
+        html += f'<p>新微博涉及<strong>婚姻状态</strong>相关内容（关键词：{", ".join(matches["婚姻状态"])}），'
+        if "事实离婚" in all_new_text or "保持家庭完整" in all_new_text:
+            html += '与深度分析报告中"事实离婚但保持家庭完整"的核心判定<strong>一致</strong>，婚姻状态未发生根本变化。</p>\n'
+        else:
+            html += '与深度分析报告中记录的婚姻演变轨迹存在关联，需关注是否有新的状态变化。</p>\n'
+    else:
+        html += '<p>新微博未直接涉及婚姻状态主题。</p>\n'
+
+    # 2. Emotional trend comparison
+    html += '<h3>3.2 情绪趋势对比</h3>\n'
+    positive_words = ["开心", "快乐", "幸福", "美好", "温暖", "喜欢", "爱", "感谢", "感恩", "希望", "期待", "释然", "平静", "安心"]
+    negative_words = ["难过", "伤心", "遗憾", "泪", "哭", "痛苦", "荒凉", "冷", "孤独", "寂寞", "失去", "结束", "再见"]
+    found_pos = [w for w in positive_words if w in all_new_text]
+    found_neg = [w for w in negative_words if w in all_new_text]
+
+    if len(found_neg) > len(found_pos):
+        html += f'<p>新微博情绪偏<strong>低落/感伤</strong>（关键词：{", ".join(found_neg) if found_neg else "无"}），'
+        html += '与深度分析报告中2026年"定性期"的情绪基调（苦涩但清醒的平衡）基本吻合。</p>\n'
+    elif len(found_pos) > len(found_neg):
+        html += f'<p>新微博情绪偏<strong>积极/向上</strong>（关键词：{", ".join(found_pos) if found_pos else "无"}），'
+        html += '与深度分析报告中2026年"定性期"的苦涩基调存在<strong>偏离</strong>，值得关注是否出现情绪转折。</p>\n'
+    else:
+        html += '<p>新微博情绪状态呈现<strong>矛盾/复杂</strong>特征，'
+        html += '与深度分析报告中"理性化应对"的心理画像一致——将痛苦转化为哲理。</p>\n'
+
+    # 3. Interest domain mapping
+    html += '<h3>3.3 兴趣领域映射</h3>\n'
+    domain_matches = []
+    if "情感对象" in matches:
+        domain_matches.append(f'爱情/思念（关键词：{", ".join(matches["情感对象"])}）')
+    if "应对机制" in matches:
+        domain_matches.append(f'饮酒/孤独（关键词：{", ".join(matches["应对机制"])}）')
+    if "文学表达" in matches:
+        domain_matches.append(f'文学投射（关键词：{", ".join(matches["文学表达"])}）')
+    if "家庭角色" in matches:
+        domain_matches.append(f'家庭/育儿（关键词：{", ".join(matches["家庭角色"])}）')
+
+    if domain_matches:
+        html += f'<p>新微博涉及的领域与深度分析报告中的核心主题<strong>相符</strong>：{"；".join(domain_matches)}。</p>\n'
+    else:
+        html += '<p>新微博未明显涉及深度分析报告中的核心主题领域，可能出现了<strong>新的兴趣方向</strong>。</p>\n'
+
+    # 4. New information discovery
+    html += '<h3>3.4 新信息发现</h3>\n'
+    deep_themes = ["事实离婚", "保持家庭完整", "鹏", "老铁", "姐们", "蜜蜜", "深圳", "南山", "东山岛"]
+    new_info = [kw for kw in deep_themes if kw not in deep_analysis[:200] or kw not in all_new_text]
+    html += '<p>基于深度分析报告框架，新微博'
+    if not any(kw in all_new_text for kw in deep_themes):
+        html += '未触发报告中的核心关键词，内容可能属于日常记录或新的表达方向。'
+    else:
+        html += '触发了报告中的核心关键词，与既有分析框架高度关联。'
+    html += '建议结合微博原文和深度分析报告进行综合判断。</p>\n'
+
+    # 5. Deep interpretation
+    html += '<h3>3.5 深度解读与预判</h3>\n'
+    html += '<blockquote>'
+    if "情感对象" in matches and ("酒" in all_new_text or "饮" in all_new_text):
+        html += '新微博在饮酒场景中再次提及情感对象，与深度分析报告中"避不开的你"的模式一致——即使事实离婚后，'
+        html += '「你」仍是酒局话题中不可回避的精神存在。这一模式从2013年延续至今，表明情感创伤尚未真正愈合。'
+    elif "情绪基调" in matches:
+        html += '新微博的情绪表达与深度分析报告中2026年"定性期"的基调一致——已达苦涩但清醒的平衡，'
+        html += '"稳定平常心，只聊平常事"。理性化应对机制持续发挥作用。'
+    else:
+        html += '新微博内容未直接触发深度分析报告的核心主题，但结合用户的心理画像（高敏感+诗意化倾向），'
+        html += '建议关注是否为情绪转换的信号或新的生活事件记录。'
+    html += '</blockquote>\n'
+
+    return html
+
+
+def generate_combined_analysis(full_analysis, deep_analysis, new_posts, all_posts, image_map, screenshots, enhanced_data):
     """Generate combined analysis report as HTML"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -492,8 +704,12 @@ th {{ background: #f0f0f0; font-weight: bold; }}
     else:
         html += "<p><em>本次检查无新增微博，以下为已有微博的汇总分析。</em></p>\n<hr>\n"
 
+    # Cross-analysis with deep analysis report
+    html += cross_analyze_with_deep_report(new_posts, deep_analysis)
+    html += "<hr>\n"
+
     # All posts summary
-    html += "\n<h2>三、全部微博记录汇总</h2>\n<table>\n<tr><th>#</th><th>发布时间</th><th>内容摘要</th><th>图片</th></tr>\n"
+    html += "\n<h2>四、全部微博记录汇总</h2>\n<table>\n<tr><th>#</th><th>发布时间</th><th>内容摘要</th><th>图片</th></tr>\n"
     for i, post in enumerate(all_posts, 1):
         text = (post.get("text", "") or post.get("title", ""))[:50]
         pub = post.get("pub_date", "") or post.get("first_seen", "")
@@ -509,7 +725,7 @@ th {{ background: #f0f0f0; font-weight: bold; }}
     html += "</table>\n<hr>\n"
 
     # Historical analysis (truncated to keep PDF size under email limits)
-    html += "\n<h2>四、历史完整分析报告（摘要）</h2>\n<blockquote>以下为历史分析报告摘要，完整报告请见 GitHub 仓库。</blockquote>\n<hr>\n"
+    html += "\n<h2>五、历史完整分析报告（摘要）</h2>\n<blockquote>以下为历史分析报告摘要，完整报告请见 GitHub 仓库。</blockquote>\n<hr>\n"
     if full_analysis:
         try:
             import markdown2
@@ -884,7 +1100,8 @@ def main():
 
     print("\n[6b] Generating combined analysis...")
     full_analysis = load_full_analysis()
-    analysis_html = generate_combined_analysis(full_analysis, new_posts, records["all_posts"], image_map, {}, enhanced_data)
+    deep_analysis = load_deep_analysis()
+    analysis_html = generate_combined_analysis(full_analysis, deep_analysis, new_posts, records["all_posts"], image_map, {}, enhanced_data)
 
     now_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     analysis_pdf = f"{REPORTS_DIR}/analysis_{now_str}.pdf"
@@ -902,16 +1119,56 @@ def main():
     else:
         records_pdf = None
 
-    # Step 8: Send email
-    print("\n[8] Sending email...")
-    attachments = [f for f in [analysis_pdf, records_pdf] if f and os.path.exists(f)]
-    if attachments:
+    # Step 8: Send emails (screenshots PDF and analysis report separately)
+    print("\n[8] Sending emails...")
+    now_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    new_count = len(new_posts)
+    total_count = len(records["known_guids"])
+
+    # Email 1: Screenshots/Records PDF
+    if records_pdf and os.path.exists(records_pdf):
+        subject1 = f"KK_szlife 微博截图更新 {now_date}"
+        body1 = f"监控用户 UID: 2241280342\n新增微博: {new_count} 条, 总计: {total_count} 条\n日期: {now_date}\n\n附件为本次监控的微博记录汇总（含截图和图片）。"
         try:
-            send_email(attachments, len(new_posts), len(records["known_guids"]))
+            send_single_email(records_pdf, subject1, body1)
+            print(f"    Screenshots email sent: {os.path.basename(records_pdf)}")
         except Exception as e:
-            print(f"    Email error: {e}")
+            print(f"    Screenshots email failed: {e}")
+            # Fallback: text email with GitHub link
+            try:
+                github_url = f"https://github.com/{GITHUB_REPO}/raw/{GITHUB_BRANCH}/{records_pdf}"
+                send_text_email(f"KK_szlife 微博截图下载链接 {now_date}", f"截图PDF下载: {github_url}\n新增微博: {new_count} 条")
+            except Exception as e2:
+                print(f"    Fallback also failed: {e2}")
     else:
-        print("    No attachments to send")
+        print("    No records PDF to send")
+
+    # Email 2: Analysis Report PDF
+    if analysis_pdf and os.path.exists(analysis_pdf):
+        subject2 = f"KK_szlife 微博监控分析报告 {now_date}"
+        body2 = f"监控用户 UID: 2241280342\n新增微博: {new_count} 条, 总计: {total_count} 条\n日期: {now_date}\n\n附件为本次监控的综合分析报告，包含情绪分析、与个人生活深度分析报告的交叉分析等。"
+        try:
+            send_single_email(analysis_pdf, subject2, body2)
+            print(f"    Analysis report email sent: {os.path.basename(analysis_pdf)}")
+        except Exception as e:
+            print(f"    Analysis report email failed: {e}")
+            # Fallback: text email with GitHub link
+            try:
+                github_url = f"https://github.com/{GITHUB_REPO}/raw/{GITHUB_BRANCH}/{analysis_pdf}"
+                send_text_email(f"KK_szlife 分析报告下载链接 {now_date}", f"分析报告PDF下载: {github_url}\n新增微博: {new_count} 条")
+            except Exception as e2:
+                print(f"    Fallback also failed: {e2}")
+    else:
+        print("    No analysis PDF to send")
+
+    # If no new posts, still send a notification email
+    if new_count == 0:
+        try:
+            send_text_email(f"KK_szlife 微博监控报告 {now_date}（无新增）",
+                f"监控用户 UID: 2241280342\n日期: {now_date}\n\n本次检查无新增微博。")
+            print("    No-update notification email sent")
+        except Exception as e:
+            print(f"    No-update notification failed: {e}")
 
     # Cleanup
     for f in Path(REPORTS_DIR).glob("*.html"):
